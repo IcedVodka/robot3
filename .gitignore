@@ -1,0 +1,22 @@
+# Ignore all .pyc files
+*.pyc
+
+# Ignore __pycache__ directory
+__pycache__/
+
+# Ignore other Python cache files
+*.pyo
+*.pyd
+
+# datasets
+datasets/
+save/
+
+# example/teleop
+
+# third_party
+third_party/3D-ViTac_Tactile_Hardware
+third_party/dr/
+
+execution_logs/
+output/
