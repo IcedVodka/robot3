@@ -23,11 +23,13 @@ class RealmanController:
         self.robot: Optional[RoboticArm] = None
         self.handle: Optional[rm_robot_handle] = None
 
-        self.hand_grip_angles = [1000, 14000, 14000, 14000, 14000, 10000]
+        self.hand_grip_angles = [1000, 13000, 13000, 13000, 13000, 10000]
         self.hand_release_angles = [4000, 17800, 17800, 17800, 17800, 10000] 
+        # self.hand_release_angles = [4000, 17800, 17800, 14000, 14000, 10000] 
+
         
 
-    def set_up(self, ip: str, port: int = 80) -> None:
+    def set_up(self, ip: str, port: int = 8080) -> None:
         """
         设置并连接机械臂
         """
@@ -201,3 +203,8 @@ class RealmanController:
             self.logger.error(f"Error during disconnect in __del__: {e}") 
 
 
+if __name__ == "__main__":
+    controller = RealmanController(name="Test")
+    controller.set_up("192.168.1.19", 8080)
+    state = controller.get_state()
+    print(state)

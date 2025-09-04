@@ -1,3 +1,4 @@
+from path_utils import add_project_root_to_path
 from Sensor.depth_camera import RealsenseSensor
 import cv2
 import numpy as np
@@ -12,6 +13,7 @@ if not os.path.exists(screenshot_dir):
 left_camera = RealsenseSensor("left_camera")    
 right_camera = RealsenseSensor("right_camera")
 
+# left_camera.set_up("327122072195")
 left_camera.set_up("327122078945")
 right_camera.set_up("207522073950")
 

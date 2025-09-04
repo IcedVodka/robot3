@@ -2,38 +2,44 @@ import argparse
 import time
 import os
 import datetime
+import json
 from typing import List, Optional
 
 import numpy as np
 import h5py
+import cv2
+from tqdm import tqdm
 
+
+from utils.logger import setup_logger
 from Controller.realman_controller import RealmanController
 from Sensor.depth_camera import RealsenseSensor
-from utils.keyboard import kb_setup, kb_restore, kb_read_char, start_kb_listener
+from utils.keyboard import start_kb_listener
 
 task_condition = {
-            "save_path": "./save/", 
-            "task_name": "test_1", 
-            "task_description": "xxxxxxxxx",
+            "outputs_path": "./save/", 
+            "task_name": "grasp", 
+            "task_description": "Open the drawer, take out the green cup, place it on the green plate, and then put the medicine bottle in the cup.",
             "save_format": "hdf5", 
             "save_freq": 30,
         }
-realsense1_serial = "1234567890"
-realsense2_serial = "1234567891"
-realsense1_intr = {
-    "color": {"ppx": 320.1, "ppy": 240.5, "fx": 600.2, "fy": 599.8},
-    "depth": {"ppx": 320.0, "ppy": 240.0, "fx": 601.0, "fy": 600.0},
-}
-realsense2_intr = {
-    "color": {"ppx": 319.8, "ppy": 241.0, "fx": 602.3, "fy": 601.1},
-    "depth": {"ppx": 319.7, "ppy": 240.2, "fx": 603.0, "fy": 602.5},
-}
-
+realsense1_serial = "207522073950"
+realsense2_serial = "327122078945"
+realsense1_intr = {'color': {'ppx': 324.6168212890625, 'ppy': 246.23873901367188, 'fx': 605.5936279296875, 'fy': 604.6068725585938}, 
+                   'depth': {'ppx': 320.8646545410156, 'ppy': 236.83616638183594, 'fx': 382.53472900390625, 'fy': 382.53472900390625}}
+realsense2_intr = {'color': {'ppx': 327.67547607421875, 'ppy': 245.18077087402344, 'fx': 608.4032592773438, 'fy': 608.064208984375}, 
+                   'depth': {'ppx': 323.422119140625, 'ppy': 241.96876525878906, 'fx': 388.0012512207031, 'fy': 388.0012512207031}}
 def extract_joints(state: dict) -> Optional[List[float]]:
     # 常见键名兼容处理
     for key in ["joint", "joints", "joint_degree", "joint_degrees", "q"]:
         if key in state and isinstance(state[key], (list, tuple)):
             return list(state[key])
+    return None
+
+def extract_pose(state: dict) -> Optional[List[float]]:
+    # 提取pose数据
+    if "pose" in state and isinstance(state["pose"], (list, tuple)):
+        return list(state["pose"])
     return None
 
 
@@ -43,6 +49,13 @@ class data_collection:
         self.file = None
         self.step_idx = 0
         self.initialized = False
+        self.run_dir = None
+        self.h5_path = None
+        # 内存帧缓存：按相机、模态分别存储
+        self.frames = {
+            "realsense1": {"color": [], "depth": []},
+            "realsense2": {"color": [], "depth": []},
+        }
         self.meta = {
             "realsense1": None,
             "realsense2": None,
@@ -50,12 +63,17 @@ class data_collection:
 
     def set_up(self, cfg: dict) -> None:
         self.cfg = cfg or {}
-        save_path = self.cfg.get("save_path", "./save/")
         task_name = self.cfg.get("task_name", "session")
-        os.makedirs(save_path, exist_ok=True)
+        outputs_path = self.cfg.get("outputs_path", "./outputs/")
+        os.makedirs(outputs_path, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"{task_name}_{ts}.h5"
-        self.file = h5py.File(os.path.join(save_path, fname), "w")
+        base = f"{task_name}_{ts}"
+        # 运行输出目录：包含h5、summary与视频
+        self.run_dir = os.path.join(outputs_path, base)
+        os.makedirs(self.run_dir, exist_ok=True)
+        fname = f"{base}.h5"
+        self.h5_path = os.path.join(self.run_dir, fname)
+        self.file = h5py.File(self.h5_path, "w")
 
         # 顶层元信息
         self.file.attrs["task_name"] = task_name
@@ -87,6 +105,13 @@ class data_collection:
                     else:
                         sub.attrs[k] = v
 
+        # 同时把相机信息写入HDF5顶层元信息（JSON字符串）
+        try:
+            self.file.attrs["realsense1"] = json.dumps(self.meta["realsense1"], ensure_ascii=False)
+            self.file.attrs["realsense2"] = json.dumps(self.meta["realsense2"], ensure_ascii=False)
+        except Exception:
+            pass
+
     def _init_datasets(self, data1: dict, data2: dict, state: dict) -> None:
         # 基于第一帧动态建表
         rs1_grp = self.file["sensors/realsense1"]
@@ -110,7 +135,7 @@ class data_collection:
         self.ds_rs2_color = create_image_ds(rs2_grp, "color", data2.get("color") if data2 else None)
         self.ds_rs2_depth = create_image_ds(rs2_grp, "depth", data2.get("depth") if data2 else None)
 
-        # 机器人状态（保存关节与手爪状态）
+        # 机器人状态（保存关节、位姿与手爪状态）
         joints = extract_joints(state) if state else None
         if joints is None:
             joints = []
@@ -118,6 +143,16 @@ class data_collection:
         self.ds_slave_joint = robot_grp.create_dataset(
             "joint", shape=(0, joints.shape[0] if joints.ndim else 0), maxshape=(None, joints.shape[0] if joints.ndim else 0), chunks=(1, joints.shape[0] if joints.ndim else 1), dtype=np.float64
         )
+        
+        # 位姿数据（6DOF: x, y, z, rx, ry, rz）
+        pose = extract_pose(state) if state else None
+        if pose is None:
+            pose = []
+        pose = np.asarray(pose, dtype=np.float64)
+        self.ds_slave_pose = robot_grp.create_dataset(
+            "pose", shape=(0, pose.shape[0] if pose.ndim else 0), maxshape=(None, pose.shape[0] if pose.ndim else 0), chunks=(1, pose.shape[0] if pose.ndim else 1), dtype=np.float64
+        )
+        
         # 手爪状态：0=开, 1=合
         self.ds_gripper_state = robot_grp.create_dataset(
             "gripper_state", shape=(0,), maxshape=(None,), chunks=(1024,), dtype=np.int8
@@ -169,39 +204,118 @@ class data_collection:
             # 若首次关节维度未知（极少见），则重新定义不做，直接跳过保存
             pass
 
+        pose = extract_pose(robot_state or {}) or []
+        pose = np.asarray(pose, dtype=np.float64)
+        if self.ds_slave_pose.shape[1] == 0 and pose.size > 0:
+            # 若首次位姿维度未知（极少见），则重新定义不做，直接跳过保存
+            pass
+
         # 追加写入
         self._append_ds(self.ds_time, t)
         self._append_ds(self.ds_rs1_color, color1)
         self._append_ds(self.ds_rs1_depth, depth1)
         self._append_ds(self.ds_rs2_color, color2)
         self._append_ds(self.ds_rs2_depth, depth2)
+
+        # 同步缓存到内存用于保存时拼接视频
+        if color1 is not None:
+            self.frames["realsense1"]["color"].append(np.array(color1))
+        if depth1 is not None:
+            self.frames["realsense1"]["depth"].append(np.array(depth1))
+        if color2 is not None:
+            self.frames["realsense2"]["color"].append(np.array(color2))
+        if depth2 is not None:
+            self.frames["realsense2"]["depth"].append(np.array(depth2))
         if gripper_state is not None:
             try:
                 self._append_ds(self.ds_gripper_state, np.int8(gripper_state))
             except Exception:
                 pass
 
-        # 关节
+        # 关节数据
         cur = self.ds_slave_joint.shape[0]
         self.ds_slave_joint.resize((cur + 1, self.ds_slave_joint.shape[1]))
         if joints.size == self.ds_slave_joint.shape[1]:
             self.ds_slave_joint[cur, :] = joints
 
+        # 位姿数据
+        cur = self.ds_slave_pose.shape[0]
+        self.ds_slave_pose.resize((cur + 1, self.ds_slave_pose.shape[1]))
+        if pose.size == self.ds_slave_pose.shape[1]:
+            self.ds_slave_pose[cur, :] = pose
+
         self.step_idx += 1
         if self.step_idx % max(1, self.save_freq) == 0:
             self.file.flush()
 
+    def _normalize_depth_to_uint8(self, depth: np.ndarray) -> np.ndarray:
+        if depth.ndim == 2:
+            d = depth.astype(np.float32)
+            finite = np.isfinite(d)
+            if not np.any(finite):
+                return np.zeros_like(d, dtype=np.uint8)
+            vmin = np.percentile(d[finite], 1)
+            vmax = np.percentile(d[finite], 99)
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            d = np.clip((d - vmin) / (vmax - vmin), 0.0, 1.0)
+            d = (d * 255.0).astype(np.uint8)
+            return d
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            return self._normalize_depth_to_uint8(depth[..., 0])
+        return depth.astype(np.uint8)
+
+    def _write_video(self, frames: list, out_path: str, fps: int = 20) -> None:
+        if cv2 is None or not frames:
+            return
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+        try:
+            iterator = frames
+            if tqdm is not None:
+                desc = f"Writing {os.path.basename(out_path)}"
+                iterator = tqdm(frames, desc=desc, unit="frame")
+            for frm in iterator:
+                if frm.ndim == 2:
+                    frm = cv2.cvtColor(frm, cv2.COLOR_GRAY2BGR)
+                vw.write(frm)
+        finally:
+            vw.release()
+    
+
     def save(self) -> None:
         if self.file is not None:
+            # 关闭前确保将相机元信息顶层属性写入完成
             self.file.flush()
             self.file.close()
             self.file = None
             self.initialized = False
 
+
+            # 将缓存帧写为视频
+            fps = int(self.cfg.get("save_freq", 30))
+            for cam in ["realsense1", "realsense2"]:
+                # 彩色
+                color_frames = self.frames.get(cam, {}).get("color", [])
+                if color_frames:
+                    self._write_video(color_frames, os.path.join(self.run_dir, f"{cam}_color.mp4"), fps=fps)
+                # 深度（归一化到8位）
+                depth_frames_src = self.frames.get(cam, {}).get("depth", [])
+                if depth_frames_src:
+                    depth_frames = [self._normalize_depth_to_uint8(x) for x in depth_frames_src]
+                    self._write_video(depth_frames, os.path.join(self.run_dir, f"{cam}_depth.mp4"), fps=fps)
+
+            # 释放内存缓存
+            self.frames = {
+                "realsense1": {"color": [], "depth": []},
+                "realsense2": {"color": [], "depth": []},
+            }
+
 class Teleop:
     def __init__(self, master_ip: str, slave_ip: str, port: int = 8080, rate: float = 30.0, hand: bool = False) -> None:
         self.master = RealmanController(name="Master")
-        self.slave = RealmanController(name="Slave")
+        self.slave = RealmanController(name="Slave",is_hand= True)
         self.master_ip = master_ip
         self.slave_ip = slave_ip
         self.port = port
@@ -300,6 +414,8 @@ class Teleop:
 
     def stop(self) -> None:
         self.running = False
+        self.realsense1.cleanup()
+        self.realsense2.cleanup()
         self.data_collection.save()
 
 
@@ -321,5 +437,6 @@ def main():
 
 
 if __name__ == "__main__":
+    setup_logger()
     main()
 
