@@ -15,6 +15,8 @@ from utils.logger import setup_logger
 from Controller.realman_controller import RealmanController
 from Sensor.depth_camera import RealsenseSensor
 from utils.keyboard import start_kb_listener
+from utils.hand_serial import SerialAngleReader
+from utils.angle_mapper import AngleLinearMapper
 
 task_condition = {
             "outputs_path": "./save/", 
@@ -30,7 +32,10 @@ realsense1_intr = {'color': {'ppx': 324.6168212890625, 'ppy': 246.23873901367188
 realsense2_intr = {'color': {'ppx': 327.67547607421875, 'ppy': 245.18077087402344, 'fx': 608.4032592773438, 'fy': 608.064208984375}, 
                    'depth': {'ppx': 323.422119140625, 'ppy': 241.96876525878906, 'fx': 388.0012512207031, 'fy': 388.0012512207031}}
 
-
+in_mins = [0, 0, 0, 0, 0, 0]
+in_maxs = [1023, 1023, 1023, 1023, 1023, 1023]
+out_mins = [0, 0, 0, 0, 0, 0]
+out_maxs = [180, 180, 180, 180, 180, 180]
 
 class data_collection:
     def __init__(self) -> None:
@@ -91,10 +96,7 @@ class data_collection:
             "pose", shape=(0, 6), maxshape=(None, 6), chunks=(1, 6), dtype=np.float64
         )
         
-        # 手爪状态：0=开, 1=合
-        self.ds_gripper_state = robot_grp.create_dataset(
-            "gripper_state", shape=(0,), maxshape=(None,), chunks=(1024,), dtype=np.int8
-        )
+        
 
         # 时间戳（统一采样时间）
         self.ds_time = ts_grp.create_dataset("sample_time", shape=(0,), maxshape=(None,), chunks=(1024,), dtype=np.float64)
@@ -108,7 +110,7 @@ class data_collection:
         ds.resize((cur + 1,) + ds.shape[1:])
         ds[cur] = sample
 
-    def collect(self, data1: Optional[dict], data2: Optional[dict], robot_state: Optional[dict], gripper_state: Optional[int] = None) -> None:
+    def collect(self, data1: Optional[dict], data2: Optional[dict], robot_state: Optional[dict]) -> None:
         if self.file is None:
             return
 
@@ -134,8 +136,6 @@ class data_collection:
 
         # 追加写入（仅写入非图像数据）
         self._append_ds(self.ds_time, t)        
-        if gripper_state is not None:
-            self._append_ds(self.ds_gripper_state, np.int8(gripper_state))
 
         # 关节与位姿数据（固定维度）
         joints = (robot_state or {}).get("joints")
@@ -231,13 +231,16 @@ class Teleop:
         self.paused = False
         self.hand_enabled = bool(hand)
         self._last_ts: Optional[float] = None
-        # 手爪状态：0=开, 1=合
-        self.gripper_state: int = 0
+        
 
         self.data_collection = data_collection()
 
         self.realsense1 = RealsenseSensor(name="Realsense1")
         self.realsense2 = RealsenseSensor(name="Realsense2")
+
+        # 串口读取与角度映射
+        self.serial_reader = SerialAngleReader()
+        self.angle_mapper = AngleLinearMapper(in_mins, in_maxs, out_mins, out_maxs)
 
     def connect(self) -> None:
         self.master.set_up(self.master_ip, self.port)
@@ -245,11 +248,12 @@ class Teleop:
         # 启用手爪控制（共享同一连接）
         if self.hand_enabled:
             self.slave.is_hand = True
+            # 启动串口后台线程
+            self.serial_reader.start()
         self.realsense1.set_up(realsense1_serial)
         self.realsense2.set_up(realsense2_serial)
         self.data_collection.set_up(task_condition)
-        # 元数据已在 set_up 中一次性写入
-
+       
     def step(self) -> None:
         state = self.master.get_state()
         joints = state.get("joints") if isinstance(state, dict) else None
@@ -258,16 +262,28 @@ class Teleop:
                 self.slave.set_arm_joints(joints)
             except Exception:
                 pass
+        # 手数据：串口读取 -> 线性映射 -> 设置位置（不保存）
+        if self.hand_enabled:
+            try:
+                angles = self.serial_reader.get_latest()
+                if angles is not None:
+                    mapped = self.angle_mapper.map_angles(angles)
+                    # 非阻塞发送，避免影响循环频率
+                    self.slave.set_hand_pos(mapped, block=False)
+            except Exception:
+                pass
         data1 = self.realsense1.get_information()
         data2 = self.realsense2.get_information()
         data3 = self.slave.get_state()
-        self.data_collection.collect(data1, data2, data3, gripper_state=self.gripper_state)   
+        self.data_collection.collect(data1, data2, data3)
+
+
         
 
     def start(self) -> None:
         self.connect()
         print(f"开始遥操作：{self.master_ip} -> {self.slave_ip}，频率 {self.rate} Hz。")
-        print("键盘控制: [e]暂停/继续  [q]结束  [a]手爪开  [d]手爪合")
+        print("键盘控制: [e]暂停/继续  [q]结束")
 
         self.running = True
         self.paused = False
@@ -288,20 +304,7 @@ class Teleop:
                     elif key in ('e', 'E'):
                         self.paused = not self.paused
                         print("已暂停" if self.paused else "继续运行")
-                    elif key in ('a', 'A') and self.hand_enabled:
-                        try:
-                            self.slave.release_hand(block=False)
-                            print("手爪开")
-                            self.gripper_state = 0
-                        except Exception:
-                            pass
-                    elif key in ('d', 'D') and self.hand_enabled:
-                        try:
-                            self.slave.grip_hand(block=False)
-                            print("手爪合")
-                            self.gripper_state = 1
-                        except Exception:
-                            pass
+
 
                 if not self.paused and self.running:
                     self.step()
@@ -322,6 +325,8 @@ class Teleop:
         self.realsense1.cleanup()
         self.realsense2.cleanup()
         self.data_collection.save()
+        self.serial_reader.stop()
+
 
 
 def main():
