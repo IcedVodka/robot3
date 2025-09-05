@@ -9,6 +9,7 @@ class AngleLinearMapper:
     - 输入 `angles` 为 int 的列表
     - 将值从 [in_min, in_max] 线性映射到 [out_min, out_max]
     - 运行期间自动统计出现过的总体最小/最大值，并在进程结束时打印
+    - 可选对输出做指数平滑以获得更平稳的控制
     """
 
     def __init__(
@@ -21,6 +22,8 @@ class AngleLinearMapper:
         clip: bool = True,
         round_output: bool = True,
         reverse_mapping: List[bool] = None,
+        smooth: bool = True,
+        smooth_alpha: float = 0.2,
     ) -> None:
         if not (len(in_mins) == len(in_maxs) == len(out_mins) == len(out_maxs) == 6):
             raise ValueError("in_mins/in_maxs/out_mins/out_maxs 必须都是长度为 6 的列表")
@@ -31,6 +34,8 @@ class AngleLinearMapper:
         self.out_maxs = list(out_maxs)
         self.clip = clip
         self.round_output = round_output
+        self.smooth = smooth
+        self.smooth_alpha = float(smooth_alpha)
         
         # 处理 reverse_mapping 参数
         if reverse_mapping is None:
@@ -47,6 +52,14 @@ class AngleLinearMapper:
         
         # 存储所有观察到的唯一值，用于计算去除极值后的范围
         self._unique_values: List[set] = [set() for _ in range(6)]
+
+        # 平滑状态（每通道一个 EMA 状态）
+        self._ema_values: List[Optional[float]] = [None] * 6
+
+        # 参数校验
+        if self.smooth:
+            if not (0.0 < self.smooth_alpha <= 1.0):
+                raise ValueError("smooth_alpha 必须在 (0, 1] 区间内")
 
         atexit.register(self._print_stats)
 
@@ -97,7 +110,21 @@ class AngleLinearMapper:
         mapped: List[int] = []
         for i, v in enumerate(angles[:6]):
             y = self._map_value(float(v), i)
-            mapped.append(int(round(y)) if self.round_output else int(y))
+
+            # 可选指数平滑（在输出空间进行）
+            if self.smooth:
+                prev = self._ema_values[i]
+                if prev is None:
+                    ema = y
+                else:
+                    a = self.smooth_alpha
+                    ema = a * y + (1.0 - a) * prev
+                self._ema_values[i] = ema
+                y_out = ema
+            else:
+                y_out = y
+
+            mapped.append(int(round(y_out)) if self.round_output else int(y_out))
         return mapped
 
     def report(self) -> None:

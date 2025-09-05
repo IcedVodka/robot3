@@ -256,8 +256,10 @@ class Teleop:
         # 初始化手部角度读取器和映射器
         self.angle_reader = SerialAngleReader()
         self.angle_mapper = AngleLinearMapper(
-            in_mins=[33, 50, 50, 51, 70, 90],
-            in_maxs=[167, 167, 171, 169, 171, 160],
+            # in_mins=[33, 50, 50, 51, 70, 90],
+            # in_maxs=[167, 167, 171, 169, 171, 160],
+            in_mins=[-70, 70, 140, 125, 177, 34],
+            in_maxs=[152, 179, 177, 177, 180, 144],
             out_mins=[0, 0, 0, 0, 0, 0],
             out_maxs=[65535, 65535, 65535, 65535, 65535, 65535],
             clip=True,
@@ -282,6 +284,12 @@ class Teleop:
         # 启动角度读取器
         self.angle_reader.start()
 
+        state = self.master.get_state()
+        joints = state.get("joint") if isinstance(state, dict) else None
+        if joints is not None:
+            self.slave.set_arm_joints(joints)
+        time.sleep(2)
+
     def step(self) -> None:
         state = self.master.get_state()
         joints = state.get("joint") if isinstance(state, dict) else None
@@ -299,7 +307,8 @@ class Teleop:
         if self.record_enabled:
             data1 = self.realsense1.get_information()
             data2 = self.realsense2.get_information()
-            data3 = self.slave.get_state()
+            # data3 = self.slave.get_state()
+            data3 = state
             self.data_collection.collect(data1, data2, data3)   
         
 
@@ -362,6 +371,7 @@ def main():
     parser.add_argument("--hand", action="store_true", help="启用手爪控制")
     parser.add_argument("--record", action="store_true", help="启用数据记录")
     args = parser.parse_args()
+    task_condition['save_freq'] = args.rate
     teleop = Teleop(master_ip=args.master_ip, slave_ip=args.slave_ip, port=args.port, rate=args.rate, hand=args.hand, record=args.record)
     try:
         teleop.start()

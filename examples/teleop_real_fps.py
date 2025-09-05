@@ -3,6 +3,7 @@ import time
 import os
 import datetime
 import json
+import logging
 from typing import List, Optional
 
 import numpy as np
@@ -11,7 +12,7 @@ import cv2
 from tqdm import tqdm
 
 
-from utils.logger import setup_logger
+from utils.logger import setup_logger,get_logger
 from Controller.realman_controller import RealmanController
 from Sensor.depth_camera import RealsenseSensor
 from utils.keyboard import start_kb_listener
@@ -31,6 +32,9 @@ realsense1_intr = {'color': {'ppx': 324.6168212890625, 'ppy': 246.23873901367188
 realsense2_intr = {'color': {'ppx': 327.67547607421875, 'ppy': 245.18077087402344, 'fx': 608.4032592773438, 'fy': 608.064208984375}, 
                    'depth': {'ppx': 323.422119140625, 'ppy': 241.96876525878906, 'fx': 388.0012512207031, 'fy': 388.0012512207031}}
 
+
+
+logger = get_logger("teleop.profile")
 
 
 class data_collection:
@@ -114,10 +118,15 @@ class data_collection:
         if self.file is None:
             return
 
-        t = time.time()
+        t_wall = time.time()
+        t0 = time.perf_counter()
 
         if not self.initialized:
+            init_start = time.perf_counter()
             self._init_datasets(data1 or {}, data2 or {}, robot_state or {})
+            init_dur_ms = (time.perf_counter() - init_start) * 1000.0
+            if init_dur_ms > 1.0:
+                logger.debug(f"collect:init_datasets {init_dur_ms:.2f} ms")
 
        # 处理图像数据（不写入HDF5，仅缓存）
         color1 = data1.get("color") if data1 else None      
@@ -125,6 +134,7 @@ class data_collection:
         color2 = data2.get("color") if data2 else None
         depth2 = data2.get("depth") if data2 else None
         # 同步缓存到内存用于保存时拼接视频
+        cache_start = time.perf_counter()
         if color1 is not None:
             self.frames["realsense1"]["color"].append(np.array(color1))
         if depth1 is not None:
@@ -133,9 +143,11 @@ class data_collection:
             self.frames["realsense2"]["color"].append(np.array(color2))
         if depth2 is not None:
             self.frames["realsense2"]["depth"].append(np.array(depth2))
+        cache_dur_ms = (time.perf_counter() - cache_start) * 1000.0
 
         # 追加写入（仅写入非图像数据）
-        self._append_ds(self.ds_time, t)        
+        h5_start = time.perf_counter()
+        self._append_ds(self.ds_time, t_wall)        
         if gripper_state is not None:
             self._append_ds(self.ds_gripper_state, np.int8(gripper_state))
 
@@ -152,9 +164,23 @@ class data_collection:
             self.ds_slave_pose.resize((cur + 1, self.ds_slave_pose.shape[1]))
             self.ds_slave_pose[cur, :] = np.asarray(pose, dtype=np.float64)
 
+        h5_dur_ms = (time.perf_counter() - h5_start) * 1000.0
+
         self.step_idx += 1
+        total_ms = (time.perf_counter() - t0) * 1000.0
         if self.step_idx % max(1, self.save_freq) == 0:
+            flush_start = time.perf_counter()
             self.file.flush()
+            flush_ms = (time.perf_counter() - flush_start) * 1000.0
+            logger.debug(
+                f"collect: cache {cache_dur_ms:.2f} ms | h5 {h5_dur_ms:.2f} ms | flush {flush_ms:.2f} ms | total {total_ms:.2f} ms"
+            )
+        else:
+            # 仅在较慢时打印
+            if total_ms > 5.0:
+                logger.debug(
+                    f"collect(slow): cache {cache_dur_ms:.2f} ms | h5 {h5_dur_ms:.2f} ms | total {total_ms:.2f} ms"
+                )
 
     def _prepare_depth_for_video(self, depth: np.ndarray) -> np.ndarray:
         """
@@ -253,6 +279,15 @@ class Teleop:
         # 手爪状态：0=开, 1=合
         self.gripper_state: int = 0
 
+        # profiling 控制
+        self.profile_every = 30  # 每N步输出一次详细profile
+        self.profile_warn_ms = 5.0  # 单步骤超过该阈值则输出一次
+
+        # FPS计算相关变量
+        self._fps_counter = 0
+        self._fps_start_time = None
+        self._last_fps_display_time = None
+
         self.data_collection = data_collection()
 
         self.realsense1 = RealsenseSensor(name="Realsense1")
@@ -267,24 +302,51 @@ class Teleop:
         self.realsense1.set_up(realsense1_serial)
         self.realsense2.set_up(realsense2_serial)
         self.data_collection.set_up(task_condition)
-        state = self.master.get_state()
-        joints = state.get("joint") if isinstance(state, dict) else None
-        if joints is not None:
-            self.slave.set_arm_joints(joints)
-        time.sleep(1)
-
 
     def step(self) -> None:
+        # FPS计算
+        current_time = time.perf_counter()
+        step_start = current_time
+        if self._fps_start_time is None:
+            self._fps_start_time = current_time
+        self._fps_counter += 1
+        
+        t0 = time.perf_counter()
         state = self.master.get_state()
+        t_master_state_ms = (time.perf_counter() - t0) * 1000.0
         joints = state.get("joint") if isinstance(state, dict) else None
         if joints is not None:
+            t1 = time.perf_counter()
             self.slave.set_arm_joints(joints)
+            t_slave_set_ms = (time.perf_counter() - t1) * 1000.0
+        else:
+            t_slave_set_ms = 0.0
             
+        t2 = time.perf_counter()
         data1 = self.realsense1.get_information()
+        t_cam1_ms = (time.perf_counter() - t2) * 1000.0
+
+        t3 = time.perf_counter()
         data2 = self.realsense2.get_information()
+        t_cam2_ms = (time.perf_counter() - t3) * 1000.0
+
+        t4 = time.perf_counter()
         # data3 = self.slave.get_state()
         data3 = state
+        t_slave_state_ms = (time.perf_counter() - t4) * 1000.0
+
+        t5 = time.perf_counter()
         self.data_collection.collect(data1, data2, data3, gripper_state=self.gripper_state)   
+        t_collect_ms = (time.perf_counter() - t5) * 1000.0
+
+        step_total_ms = (time.perf_counter() - step_start) * 1000.0
+
+        # 按需输出详细profile
+        if (self._fps_counter % max(1, self.profile_every) == 0) or (step_total_ms > self.profile_warn_ms):
+            logger.debug(
+                "step: master_state %.2f ms | slave_set %.2f ms | cam1 %.2f ms | cam2 %.2f ms | slave_state %.2f ms | collect %.2f ms | total %.2f ms"
+                % (t_master_state_ms, t_slave_set_ms, t_cam1_ms, t_cam2_ms, t_slave_state_ms, t_collect_ms, step_total_ms)
+            )
         
 
     def start(self) -> None:
@@ -295,6 +357,7 @@ class Teleop:
         self.running = True
         self.paused = False
         self._last_ts = None
+        self._last_fps_display_time = None
 
         t, stop_evt, q = start_kb_listener()
         try:
@@ -328,6 +391,16 @@ class Teleop:
 
                 if not self.paused and self.running:
                     self.step()
+                    
+                    # 每2秒显示一次实际FPS
+                    current_time = time.perf_counter()
+                    if (self._last_fps_display_time is None or 
+                        current_time - self._last_fps_display_time >= 2.0):
+                        if self._fps_counter > 0 and self._fps_start_time is not None:
+                            elapsed_time = current_time - self._fps_start_time
+                            actual_fps = self._fps_counter / elapsed_time
+                            print(f"实际FPS: {actual_fps:.1f} Hz (目标: {self.rate:.1f} Hz)")
+                        self._last_fps_display_time = current_time
 
                 # 定频
                 now = time.perf_counter()
@@ -366,6 +439,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # setup_logger(log_level=logging.DEBUG, enable_color=True)
     setup_logger()
     main()
 
