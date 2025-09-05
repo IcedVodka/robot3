@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import serial
 
+
 # 串口配置（根据实际设备修改）
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUDRATE = 9600
@@ -55,10 +56,10 @@ class SerialAngleReader:
             except Exception:
                 continue
 
-            if not raw or "：" not in raw:
+            if not raw or "#" not in raw:
                 continue
 
-            angle_str = raw.split("：")[-1]
+            angle_str = raw.split("#")[-1]
             angle_list: List[int] = []
             for x in angle_str.split(","):
                 s = x.strip()
@@ -76,6 +77,18 @@ class SerialAngleReader:
 # 简单示例：作为脚本运行时打印最新数据
 if __name__ == "__main__":
     import time
+    from angle_mapper import AngleLinearMapper
+    # 创建角度映射器：从 [0, 1023] 映射到 [0, 180]
+    mapper = AngleLinearMapper(
+        in_mins=[33, 50, 50, 51, 70, 90],
+        in_maxs=[167, 167, 171, 169, 171, 160],
+        out_mins=[0, 0, 0, 0, 0, 0],
+        out_maxs=[65535, 65535, 65535, 65535, 65535, 65535],
+        clip=True,
+        round_output=True,
+        reverse_mapping=[True, True, True, True, True, False]
+    )
+
 
     reader = SerialAngleReader()
     reader.start()
@@ -83,9 +96,13 @@ if __name__ == "__main__":
         while True:
             angles = reader.get_latest()
             if angles is not None:
-                print(f"angle_list={angles}")
+                # 使用映射器转换角度
+                mapped_angles = mapper.map_angles(angles)
+                print(f"原始角度: {angles} => 映射后: {mapped_angles}")
             time.sleep(0.1)
     except KeyboardInterrupt:
         pass
     finally:
         reader.stop()
+        # 打印统计信息
+        # mapper.report()

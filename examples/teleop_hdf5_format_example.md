@@ -8,6 +8,7 @@ grasp_20250904_103419.h5
 │   ├── task_name: "grasp"
 │   ├── task_description: "xxxxxxxxx"│  
 │   ├── created_at: "20250904_103419"
+│   ├── depth_alpha: 0.03  # 深度图转换为8位时的缩放参数
 │   ├── realsense1: "{...}"  # 相机1内参（JSON字符串）
 │   └── realsense2: "{...}"  # 相机2内参（JSON字符串）
 │
@@ -25,11 +26,11 @@ grasp_20250904_103419.h5
 ## 视频输出文件
 
 - realsense1_color.mp4
-- realsense1_depth.mp4（深度归一化到 8bit）
+- realsense1_depth.mp4（深度图使用cv2.convertScaleAbs转换为8bit，alpha=0.03）
 - realsense2_color.mp4
-- realsense2_depth.mp4（深度归一化到 8bit）
+- realsense2_depth.mp4（深度图使用cv2.convertScaleAbs转换为8bit，alpha=0.03）
 
-说明：视频文件与 HDF5 位于同一运行输出目录，帧率 `fps = save_freq`。
+说明：视频文件与 HDF5 位于同一运行输出目录，帧率 `fps = save_freq`。深度视频使用cv2.convertScaleAbs进行线性缩放转换，alpha参数可在task_condition中配置。
 
 ## 机器人状态数据示例
 
@@ -48,7 +49,22 @@ robot_state = {
 - 位姿数据集 `robot/pose`: 形状 (N, 6)，[x, y, z, rx, ry, rz]
 - 手爪状态 `robot/gripper_state`: 形状 (N,)
 - 时间戳 `timestamps/sample_time`: 形状 (N,)
-- 顶层属性包含 `realsense1`/`realsense2`（JSON 格式内参）
+- 顶层属性包含 `realsense1`/`realsense2`（JSON 格式内参）和 `depth_alpha`（深度转换参数）
+
+## 深度图处理说明
+
+深度图使用 `cv2.convertScaleAbs` 方法进行线性缩放转换：
+
+```python
+# 深度转换公式
+depth_8bit = cv2.convertScaleAbs(depth, alpha=depth_alpha)
+# 其中 depth_alpha 默认为 0.03，可在 task_condition 中配置
+```
+
+- **输入**：原始16位深度数据（单位：毫米）
+- **输出**：8位灰度图像（范围：0-255）
+- **转换方式**：线性缩放 `result = |input * alpha|`
+- **配置参数**：`depth_alpha` 在 HDF5 元信息中保存，便于复现
 
 ## 数据同步
 
@@ -64,6 +80,7 @@ import json
 with h5py.File('grasp_20250904_103419.h5', 'r') as f:
     # 读取属性
     task_name = f.attrs.get('task_name', '')
+    depth_alpha = f.attrs.get('depth_alpha', 0.03)  # 深度转换参数
     intr1 = json.loads(f.attrs.get('realsense1', '{}'))
     intr2 = json.loads(f.attrs.get('realsense2', '{}'))
 
@@ -73,5 +90,7 @@ with h5py.File('grasp_20250904_103419.h5', 'r') as f:
     timestamps = f['timestamps/sample_time'][:]
     gripper_states = f['robot/gripper_state'][:]
 
-    print(len(timestamps), joints.shape, poses.shape, gripper_states.shape)
+    print(f"任务: {task_name}")
+    print(f"深度转换参数: {depth_alpha}")
+    print(f"数据长度: {len(timestamps)}, 关节形状: {joints.shape}, 位姿形状: {poses.shape}, 手爪形状: {gripper_states.shape}")
 ```

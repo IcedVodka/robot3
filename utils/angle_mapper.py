@@ -1,5 +1,6 @@
 from typing import List, Optional
 import atexit
+import numpy as np
 
 
 class AngleLinearMapper:
@@ -19,6 +20,7 @@ class AngleLinearMapper:
         *,
         clip: bool = True,
         round_output: bool = True,
+        reverse_mapping: List[bool] = None,
     ) -> None:
         if not (len(in_mins) == len(in_maxs) == len(out_mins) == len(out_maxs) == 6):
             raise ValueError("in_mins/in_maxs/out_mins/out_maxs 必须都是长度为 6 的列表")
@@ -29,9 +31,22 @@ class AngleLinearMapper:
         self.out_maxs = list(out_maxs)
         self.clip = clip
         self.round_output = round_output
+        
+        # 处理 reverse_mapping 参数
+        if reverse_mapping is None:
+            self.reverse_mapping = [False] * 6  # 默认全部正向映射
+        elif isinstance(reverse_mapping, bool):
+            self.reverse_mapping = [reverse_mapping] * 6  # 单个布尔值应用到所有通道
+        elif isinstance(reverse_mapping, list) and len(reverse_mapping) == 6:
+            self.reverse_mapping = list(reverse_mapping)  # 6个布尔值的列表
+        else:
+            raise ValueError("reverse_mapping 必须是布尔值或长度为6的布尔列表")
 
         self._observed_min: List[Optional[int]] = [None] * 6
         self._observed_max: List[Optional[int]] = [None] * 6
+        
+        # 存储所有观察到的唯一值，用于计算去除极值后的范围
+        self._unique_values: List[set] = [set() for _ in range(6)]
 
         atexit.register(self._print_stats)
 
@@ -39,12 +54,16 @@ class AngleLinearMapper:
         if not values:
             return
         for i, v in enumerate(values[:6]):
+            # 更新传统的最小最大值
             ov_min = self._observed_min[i]
             ov_max = self._observed_max[i]
             if ov_min is None or v < ov_min:
                 self._observed_min[i] = v
             if ov_max is None or v > ov_max:
                 self._observed_max[i] = v
+            
+            # 存储唯一值用于后续计算去除极值后的范围
+            self._unique_values[i].add(v)
 
     def _map_value(self, x: float, idx: int) -> float:
         in_min = self.in_mins[idx]
@@ -56,7 +75,13 @@ class AngleLinearMapper:
             y = float(out_min)
         else:
             ratio = (x - in_min) / (in_max - in_min)
-            y = out_min + ratio * (out_max - out_min)
+            if self.reverse_mapping[idx]:
+                # 反向映射：in_min -> out_max, in_max -> out_min
+                y = out_max - ratio * (out_max - out_min)
+            else:
+                # 正向映射：in_min -> out_min, in_max -> out_max
+                y = out_min + ratio * (out_max - out_min)
+        
         if self.clip:
             low = min(out_min, out_max)
             high = max(out_min, out_max)
@@ -86,14 +111,59 @@ class AngleLinearMapper:
         if not any_observed:
             print("[AngleLinearMapper] 本次未收到任何 angles 数据。")
             return
-        print("[AngleLinearMapper] 本次运行每通道观察到的最小/最大值：")
+        
+        print("\n[AngleLinearMapper] 观察到的范围（去除最大10%和最小10%的唯一值）：")
+        print("in_mins=[", end="")
         for i in range(6):
-            mn = self._observed_min[i]
-            mx = self._observed_max[i]
-            if mn is None or mx is None:
-                print(f"  ch{i}: 无数据")
+            if len(self._unique_values[i]) == 0:
+                print("0", end="")
             else:
-                print(f"  ch{i}: min={mn}, max={mx}")
+                # 将唯一值转换为排序后的数组
+                unique_values = sorted(list(self._unique_values[i]))
+                if len(unique_values) < 10:  # 数据太少时使用全部数据
+                    mn = unique_values[0]
+                else:
+                    # 去除最大10%和最小10%的唯一值
+                    remove_count = max(1, len(unique_values) // 10)  # 至少去除1个
+                    filtered_values = unique_values[remove_count:-remove_count]
+                    mn = filtered_values[0] if len(filtered_values) > 0 else unique_values[0]
+                print(f"{mn}", end="")
+            if i < 5:
+                print(", ", end="")
+        print("],")
+        
+        print("in_maxs=[", end="")
+        for i in range(6):
+            if len(self._unique_values[i]) == 0:
+                print("1023", end="")
+            else:
+                # 将唯一值转换为排序后的数组
+                unique_values = sorted(list(self._unique_values[i]))
+                if len(unique_values) < 10:  # 数据太少时使用全部数据
+                    mx = unique_values[-1]
+                else:
+                    # 去除最大10%和最小10%的唯一值
+                    remove_count = max(1, len(unique_values) // 10)  # 至少去除1个
+                    filtered_values = unique_values[remove_count:-remove_count]
+                    mx = filtered_values[-1] if len(filtered_values) > 0 else unique_values[-1]
+                print(f"{mx}", end="")
+            if i < 5:
+                print(", ", end="")
+        print("],")
+        
+        print("out_mins=[", end="")
+        for i in range(6):
+            print(f"{self.out_mins[i]}", end="")
+            if i < 5:
+                print(", ", end="")
+        print("],")
+        
+        print("out_maxs=[", end="")
+        for i in range(6):
+            print(f"{self.out_maxs[i]}", end="")
+            if i < 5:
+                print(", ", end="")
+        print("],")
 
 
 __all__ = ["AngleLinearMapper"]
@@ -108,7 +178,33 @@ if __name__ == "__main__":
     out_mins = [0, 0, 0, 0, 0, 0]
     out_maxs = [180, 180, 180, 180, 180, 180]
 
-    mapper = AngleLinearMapper(in_mins, in_maxs, out_mins, out_maxs, clip=True, round_output=True)
+    # 正向映射示例（所有通道）
+    mapper = AngleLinearMapper(in_mins, in_maxs, out_mins, out_maxs, clip=True, round_output=True, reverse_mapping=False)
+    
+    print("正向映射示例 (0-1023 -> 0-180):")
+    test_values = [0, 256, 512, 768, 1023]
+    for val in test_values:
+        mapped = mapper.map_angles([val] * 6)
+        print(f"输入: {val} -> 输出: {mapped[0]}")
+    
+    print("\n反向映射示例 (0-1023 -> 180-0):")
+    mapper_reverse = AngleLinearMapper(in_mins, in_maxs, out_mins, out_maxs, clip=True, round_output=True, reverse_mapping=True)
+    for val in test_values:
+        mapped = mapper_reverse.map_angles([val] * 6)
+        print(f"输入: {val} -> 输出: {mapped[0]}")
+    
+    print("\n混合映射示例 (通道0,2,4反向，通道1,3,5正向):")
+    mixed_reverse = [True, False, True, False, True, False]
+    mapper_mixed = AngleLinearMapper(in_mins, in_maxs, out_mins, out_maxs, clip=True, round_output=True, reverse_mapping=mixed_reverse)
+    test_input = [0, 256, 512, 768, 1023, 100]
+    mapped = mapper_mixed.map_angles(test_input)
+    print(f"输入: {test_input}")
+    print(f"输出: {mapped}")
+    print("通道映射方向:", mixed_reverse)
+    
+    print("\n" + "="*50)
+    print("使用混合映射进行测试:")
+    mapper = mapper_mixed
 
     # 假设从某处读取到的六通道 angles（此处用固定示例代替）
     demo_angles_list = [

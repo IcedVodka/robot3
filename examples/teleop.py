@@ -22,6 +22,7 @@ task_condition = {
             "task_description": "Open the drawer, take out the green cup, place it on the green plate, and then put the medicine bottle in the cup.",
             "save_freq": 30,
             "joint_dof": 6,
+            "depth_alpha": 0.03,  # 深度图转换为8位时的缩放参数
         }
 realsense1_serial = "207522073950"
 realsense2_serial = "327122078945"
@@ -72,6 +73,7 @@ class data_collection:
         self.file.attrs["task_name"] = task_name
         self.file.attrs["task_description"] = self.cfg.get("task_description", "")
         self.file.attrs["created_at"] = ts
+        self.file.attrs["depth_alpha"] = float(self.cfg.get("depth_alpha", 0.03))  # 深度转换参数
         self.file.attrs["realsense1"] = json.dumps(realsense1_intr or {}, ensure_ascii=False)
         self.file.attrs["realsense2"] = json.dumps(realsense2_intr or {}, ensure_ascii=False)
     
@@ -118,7 +120,7 @@ class data_collection:
             self._init_datasets(data1 or {}, data2 or {}, robot_state or {})
 
        # 处理图像数据（不写入HDF5，仅缓存）
-        color1 = data1.get("color") if data1 else None
+        color1 = data1.get("color") if data1 else None      
         depth1 = data1.get("depth") if data1 else None
         color2 = data2.get("color") if data2 else None
         depth2 = data2.get("depth") if data2 else None
@@ -138,7 +140,7 @@ class data_collection:
             self._append_ds(self.ds_gripper_state, np.int8(gripper_state))
 
         # 关节与位姿数据（固定维度）
-        joints = (robot_state or {}).get("joints")
+        joints = (robot_state or {}).get("joint")
         if isinstance(joints, (list, tuple)) and len(joints) == self.ds_slave_joint.shape[1]:
             cur = self.ds_slave_joint.shape[0]
             self.ds_slave_joint.resize((cur + 1, self.ds_slave_joint.shape[1]))
@@ -154,38 +156,55 @@ class data_collection:
         if self.step_idx % max(1, self.save_freq) == 0:
             self.file.flush()
 
-    def _normalize_depth_to_uint8(self, depth: np.ndarray) -> np.ndarray:
+    def _prepare_depth_for_video(self, depth: np.ndarray) -> np.ndarray:
+        """
+        准备深度数据用于视频写入，使用convertScaleAbs转换为8位
+        Args:
+            depth: 原始深度数据 (H, W)，单位为毫米
+        Returns:
+            np.ndarray: 处理后的深度数据，8位格式
+        """
+        # 从配置中获取alpha参数，默认为0.03
+        alpha = float(self.cfg.get("depth_alpha", 0.03)) if self.cfg else 0.03
+        
         if depth.ndim == 2:
-            d = depth.astype(np.float32)
-            finite = np.isfinite(d)
-            if not np.any(finite):
-                return np.zeros_like(d, dtype=np.uint8)
-            vmin = np.percentile(d[finite], 1)
-            vmax = np.percentile(d[finite], 99)
-            if vmax <= vmin:
-                vmax = vmin + 1.0
-            d = np.clip((d - vmin) / (vmax - vmin), 0.0, 1.0)
-            d = (d * 255.0).astype(np.uint8)
-            return d
+            # 使用cv2.convertScaleAbs将深度数据转换为8位
+            # alpha参数用于缩放深度值到合适的范围
+            depth_8bit = cv2.convertScaleAbs(depth, alpha=alpha)
+            return depth_8bit
         if depth.ndim == 3 and depth.shape[-1] == 1:
-            return self._normalize_depth_to_uint8(depth[..., 0])
-        return depth.astype(np.uint8)
+            return self._prepare_depth_for_video(depth[..., 0])
+        return cv2.convertScaleAbs(depth, alpha=alpha)
 
-    def _write_video(self, frames: list, out_path: str, fps: int = 20) -> None:
+    def _write_video(self, frames: list, out_path: str, fps: int = 20, is_depth: bool = False) -> None:
         if cv2 is None or not frames:
             return
         h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+        
+        # 对于深度视频，使用8位灰度格式
+        if is_depth:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h), isColor=False)
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+            
         try:
             iterator = frames
             if tqdm is not None:
                 desc = f"Writing {os.path.basename(out_path)}"
                 iterator = tqdm(frames, desc=desc, unit="frame")
             for frm in iterator:
-                if frm.ndim == 2:
-                    frm = cv2.cvtColor(frm, cv2.COLOR_GRAY2BGR)
-                vw.write(frm)
+                if is_depth:
+                    # 深度视频：直接写入8位灰度数据
+                    if frm.dtype != np.uint8:
+                        frm = frm.astype(np.uint8)
+                    vw.write(frm)
+                else:
+                    # 彩色视频：转换为BGR格式
+                    if frm.ndim == 2:
+                        frm = cv2.cvtColor(frm, cv2.COLOR_GRAY2BGR)
+                    vw.write(frm)
         finally:
             vw.release()
     
@@ -205,12 +224,12 @@ class data_collection:
                 # 彩色
                 color_frames = self.frames.get(cam, {}).get("color", [])
                 if color_frames:
-                    self._write_video(color_frames, os.path.join(self.run_dir, f"{cam}_color.mp4"), fps=fps)
-                # 深度（归一化到8位）
+                    self._write_video(color_frames, os.path.join(self.run_dir, f"{cam}_color.mp4"), fps=fps, is_depth=False)
+                # 深度（保持原始16位数据）
                 depth_frames_src = self.frames.get(cam, {}).get("depth", [])
                 if depth_frames_src:
-                    depth_frames = [self._normalize_depth_to_uint8(x) for x in depth_frames_src]
-                    self._write_video(depth_frames, os.path.join(self.run_dir, f"{cam}_depth.mp4"), fps=fps)
+                    depth_frames = [self._prepare_depth_for_video(x) for x in depth_frames_src]
+                    self._write_video(depth_frames, os.path.join(self.run_dir, f"{cam}_depth.mp4"), fps=fps, is_depth=True)
 
             # 释放内存缓存
             self.frames = {
@@ -248,16 +267,13 @@ class Teleop:
         self.realsense1.set_up(realsense1_serial)
         self.realsense2.set_up(realsense2_serial)
         self.data_collection.set_up(task_condition)
-        # 元数据已在 set_up 中一次性写入
 
     def step(self) -> None:
         state = self.master.get_state()
-        joints = state.get("joints") if isinstance(state, dict) else None
+        joints = state.get("joint") if isinstance(state, dict) else None
         if joints is not None:
-            try:
-                self.slave.set_arm_joints(joints)
-            except Exception:
-                pass
+            self.slave.set_arm_joints(joints)
+            
         data1 = self.realsense1.get_information()
         data2 = self.realsense2.get_information()
         data3 = self.slave.get_state()
