@@ -41,7 +41,7 @@ class RealsenseSensor(VisionSensor):
        sensor = RealsenseSensor("camera_name")
     
     2. 设置相机参数：
-       sensor.set_up(camera_serial="123456789", is_depth=True)
+       sensor.set_up(camera_serial="123456789", is_depth=True, enable_alignment=True)
     
     3. 设置采集数据类型：
        sensor.set_collect_info(["color", "depth"])
@@ -58,6 +58,10 @@ class RealsenseSensor(VisionSensor):
     
     5. 清理资源：
        sensor.cleanup()
+    
+    ===== 对齐功能 =====
+    当enable_alignment=True时，深度图会被对齐到彩色图像的视角，解决深度图视角范围更广的问题。
+    对齐后的深度图和彩色图具有相同的分辨率和视角范围。
     
     ===== 对外接口 =====
     - __init__(name): 初始化传感器
@@ -85,26 +89,30 @@ class RealsenseSensor(VisionSensor):
         self.is_depth = False
         self._pipeline_started = False
         self.resolution = [640, 480]  # 默认分辨率
+        self.align = None  # 对齐对象
+        self.enable_alignment = False  # 是否启用对齐
         self.logger.info(f"初始化RealSense传感器: {name}")
 
-    def set_up(self, camera_serial: str, is_depth: bool = True, resolution: list = None):
+    def set_up(self, camera_serial: str, is_depth: bool = True, resolution: list = None, enable_alignment: bool = False):
         """
         设置RealSense相机
         Args:
             camera_serial: 相机序列号
             is_depth: 是否启用深度流，默认False
             resolution: 分辨率，包含两个值的list，默认[640, 480]，会保存到self.resolution
+            enable_alignment: 是否启用深度图与彩色图对齐，默认False
         Raises:
             RuntimeError: 当找不到设备或启动失败时抛出
         """
         self.is_depth = is_depth
+        self.enable_alignment = enable_alignment
         self.set_collect_info(["color", "depth"])
         if resolution is not None:
             if not (isinstance(resolution, list) and len(resolution) == 2):
                 raise ValueError("resolution参数必须为包含两个值的list，如[640, 480]")
             self.resolution = resolution
         width, height = self.resolution[0], self.resolution[1] 
-        self.logger.info(f"开始设置相机，序列号: {camera_serial}, 深度模式: {is_depth}, 分辨率: {width}x{height}")
+        self.logger.info(f"开始设置相机，序列号: {camera_serial}, 深度模式: {is_depth}, 分辨率: {width}x{height}, 对齐模式: {enable_alignment}")
 
         try:
             # 初始化RealSense上下文并检查连接的设备
@@ -136,6 +144,12 @@ class RealsenseSensor(VisionSensor):
 
             self.pipeline.start(self.config)
             self._pipeline_started = True
+            
+            # 如果启用对齐，创建对齐对象
+            if self.enable_alignment and self.is_depth:
+                self.align = rs.align(rs.stream.color)
+                self.logger.info("已启用深度图与彩色图对齐")
+            
             self._start_collection()
             self.logger.info(f"相机启动成功: {self.name} (SN: {camera_serial})")
             time.sleep(1) # 等待摄像头初始化
@@ -161,6 +175,10 @@ class RealsenseSensor(VisionSensor):
             
             if not self.collect_info:
                 return None
+            
+            # 如果启用对齐，先进行对齐处理
+            if self.enable_alignment and self.align and self.is_depth:
+                frames = self.align.process(frames)
                 
             # 获取彩色图像
             if "color" in self.collect_info:
@@ -205,6 +223,28 @@ class RealsenseSensor(VisionSensor):
         except Exception as e:
             self.logger.error(f"清理过程中发生错误: {str(e)}")
     
+    def set_alignment(self, enable: bool):
+        """
+        动态启用或禁用深度图与彩色图对齐
+        Args:
+            enable: True启用对齐，False禁用对齐
+        """
+        if not self._pipeline_started:
+            self.logger.warning("Pipeline未启动，无法设置对齐")
+            return
+            
+        if enable and not self.enable_alignment:
+            if self.is_depth:
+                self.align = rs.align(rs.stream.color)
+                self.enable_alignment = True
+                self.logger.info("已启用深度图与彩色图对齐")
+            else:
+                self.logger.warning("深度流未启用，无法使用对齐功能")
+        elif not enable and self.enable_alignment:
+            self.align = None
+            self.enable_alignment = False
+            self.logger.info("已禁用深度图与彩色图对齐")
+
     def get_intrinsics(self):
         """
         获取当前分辨率下的彩色图像和深度图像内参。

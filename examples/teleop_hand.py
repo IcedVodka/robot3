@@ -273,8 +273,9 @@ class Teleop:
         # 启用手爪控制（共享同一连接）
         if self.hand_enabled:
             self.slave.is_hand = True
-        self.realsense1.set_up(realsense1_serial)
-        self.realsense2.set_up(realsense2_serial)
+        # 启用对齐功能来解决深度图视角范围更广的问题
+        self.realsense1.set_up(realsense1_serial, enable_alignment=True)
+        self.realsense2.set_up(realsense2_serial, enable_alignment=True)
         
         # 只在启用记录时设置数据收集
         if self.record_enabled:

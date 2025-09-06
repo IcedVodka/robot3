@@ -14,7 +14,7 @@ from pathlib import Path
 def get_latest_hdf5_folder(save_dir="./save/"):
     """获取最新的HDF5文件夹"""
     # 查找所有以grasp_开头的文件夹
-    pattern = os.path.join(save_dir, "grasp_*")
+    pattern = os.path.join(save_dir, "task1_*")
     folders = glob.glob(pattern)
     
     if not folders:
@@ -349,7 +349,7 @@ def annotate_video(video_path, video_name, save_path):
 def main():
     """主函数"""
     # 获取最新文件夹
-    latest_folder = get_latest_hdf5_folder()
+    latest_folder = get_latest_hdf5_folder("./save/sun/")
     
     if latest_folder is None:
         return

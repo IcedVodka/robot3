@@ -17,9 +17,9 @@ from Sensor.depth_camera import RealsenseSensor
 from utils.keyboard import start_kb_listener
 
 task_condition = {
-            "outputs_path": "./save/", 
-            "task_name": "grasp", 
-            "task_description": "Open the drawer, take out the green cup, place it on the green plate, and then put the medicine bottle in the cup.",
+            "outputs_path": "./save/sun/", 
+            "task_name": "task1_1", 
+            "task_description": "Grasp and lift the red block.",
             "save_freq": 15,
             "joint_dof": 6,
             "depth_alpha": 0.03,  # 深度图转换为8位时的缩放参数
@@ -238,7 +238,7 @@ class data_collection:
             }
 
 class Teleop:
-    def __init__(self, master_ip: str, slave_ip: str, port: int = 8080, rate: float = 30.0, hand: bool = False) -> None:
+    def __init__(self, master_ip: str, slave_ip: str, port: int = 8080, rate: float = 30.0, hand: bool = False, gripper_init: int = 0) -> None:
         self.master = RealmanController(name="Master")
         self.slave = RealmanController(name="Slave",is_hand= True)
         self.master_ip = master_ip
@@ -251,7 +251,7 @@ class Teleop:
         self.hand_enabled = bool(hand)
         self._last_ts: Optional[float] = None
         # 手爪状态：0=开, 1=合
-        self.gripper_state: int = 0
+        self.gripper_state: int = gripper_init
 
         self.data_collection = data_collection()
 
@@ -264,13 +264,27 @@ class Teleop:
         # 启用手爪控制（共享同一连接）
         if self.hand_enabled:
             self.slave.is_hand = True
-        self.realsense1.set_up(realsense1_serial)
-        self.realsense2.set_up(realsense2_serial)
+        # 启用对齐功能来解决深度图视角范围更广的问题
+        self.realsense1.set_up(realsense1_serial, enable_alignment=True)
+        self.realsense2.set_up(realsense2_serial, enable_alignment=True)
         self.data_collection.set_up(task_condition)
         state = self.master.get_state()
         joints = state.get("joint") if isinstance(state, dict) else None
         if joints is not None:
             self.slave.set_arm_joints(joints)
+        
+        # 设置初始夹爪状态
+        if self.hand_enabled:
+            try:
+                if self.gripper_state == 0:
+                    self.slave.release_hand(block=True)
+                    print("初始夹爪状态：开")
+                else:
+                    self.slave.grip_hand(block=True)
+                    print("初始夹爪状态：合")
+            except Exception as e:
+                print(f"设置初始夹爪状态失败: {e}")
+        
         time.sleep(1)
 
 
@@ -354,9 +368,14 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="机械臂端口，默认 8080")
     parser.add_argument("--rate", type=float, default=30.0, help="发送频率 Hz，默认 30Hz")
     parser.add_argument("--hand", action="store_true", help="启用手爪控制(按 o 开, c 合)")
+    parser.add_argument("--task-name", type=str, default="task1_1", help="任务名称，默认 task1_1")
+    parser.add_argument("--task-description", type=str, default="Grasp and lift the red block.", help="任务描述，默认 Grasp and lift the red block.")
+    parser.add_argument("--gripper-init", type=int, choices=[0, 1], default=0, help="初始夹爪状态：0=开, 1=合，默认 0")
     args = parser.parse_args()
     task_condition['save_freq'] = args.rate
-    teleop = Teleop(master_ip=args.master_ip, slave_ip=args.slave_ip, port=args.port, rate=args.rate, hand=args.hand)
+    task_condition['task_name'] = args.task_name
+    task_condition['task_description'] = args.task_description
+    teleop = Teleop(master_ip=args.master_ip, slave_ip=args.slave_ip, port=args.port, rate=args.rate, hand=args.hand, gripper_init=args.gripper_init)
     try:
         teleop.start()
     except KeyboardInterrupt:
